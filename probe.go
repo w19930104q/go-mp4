@@ -3,7 +3,9 @@ package mp4
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 
 	"github.com/abema/go-mp4/internal/bitio"
 )
@@ -17,6 +19,51 @@ type ProbeInfo struct {
 	Duration         uint64
 	Tracks           Tracks
 	Segments         Segments
+	SegmentIndexes   SegmentIndexes
+}
+
+// SegmentIndexes is a list of segment index information parsed from sidx boxes.
+type SegmentIndexes []*SegmentIndex
+
+// SegmentIndex is a summary of one sidx box.
+//
+// The timescale of an sidx box is independent of the movie/track timescales,
+// therefore all time-related fields keep the unit of the originating sidx box
+// instead of being converted to a track timebase.
+type SegmentIndex struct {
+	// Offset is the byte offset of the sidx box itself.
+	Offset uint64
+	// ReferenceID is the track_ID or another sidx box referenced by this index.
+	ReferenceID uint32
+	// Timescale is the timescale used by the sidx box.
+	Timescale uint32
+	// Version is the version field of the sidx box (0 uses 32-bit offsets, 1 uses 64-bit offsets).
+	Version uint8
+	// EarliestPresentationTime is the earliest presentation time of any media
+	// content covered by the sidx box, in the sidx timescale.
+	EarliestPresentationTime uint64
+	// FirstOffset is the distance, in bytes, from the end of the sidx box to
+	// the first referenced box. It is a 64-bit value even for version-0 boxes.
+	FirstOffset uint64
+	// References summarizes the reference entries of the sidx box.
+	References []SegmentIndexReference
+}
+
+// SegmentIndexReference is one reference entry of an sidx box.
+type SegmentIndexReference struct {
+	// ReferencedType is false when the entry references media content (a moof box)
+	// and true when it references another sidx box.
+	ReferencedType bool
+	// ReferencedSize is the byte size of the referenced content.
+	ReferencedSize uint32
+	// SubsegmentDuration is the duration of the referenced content, in the sidx timescale.
+	SubsegmentDuration uint32
+	// StartsWithSAP indicates that the referenced content starts with a stream access point.
+	StartsWithSAP bool
+	// SAPType is the SAP type as defined in ISO/IEC 14496-12.
+	SAPType uint32
+	// SAPDeltaTime is the SAP delta time, in the sidx timescale.
+	SAPDeltaTime uint32
 }
 
 // Deprecated: replace with ProbeInfo
@@ -105,9 +152,22 @@ type Segment struct {
 // Probe probes MP4 file
 func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 	probeInfo := &ProbeInfo{
-		Tracks:   make([]*Track, 0, 8),
-		Segments: make([]*Segment, 0, 8),
+		Tracks:         make([]*Track, 0, 8),
+		Segments:       make([]*Segment, 0, 8),
+		SegmentIndexes: make([]*SegmentIndex, 0, 2),
 	}
+
+	fileSize, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, err
+	}
+	// Walk the complete box layout, including nested and otherwise unparsed
+	// boxes (mfra, free, uuid, ...), so a truncated box is reported as an
+	// error instead of being silently ignored. Only box headers are read.
+	if err := scanBoxHeaders(r, 0, uint64(fileSize)); err != nil {
+		return nil, err
+	}
+
 	bis, err := ExtractBoxes(r, nil, []BoxPath{
 		{BoxTypeFtyp()},
 		{BoxTypeMoov()},
@@ -115,22 +175,22 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 		{BoxTypeMoov(), BoxTypeTrak()},
 		{BoxTypeMoof()},
 		{BoxTypeMdat()},
+		{BoxTypeSidx()},
 	})
 	if err != nil {
 		return nil, err
 	}
 	var mdatAppeared bool
 	for _, bi := range bis {
+		// A declared box extending past the end of the file means the input is
+		// truncated. Return an error instead of reading partial payloads.
+		if bi.Offset+bi.Size > uint64(fileSize) {
+			return nil, fmt.Errorf("box size exceeds file size: offset=%d, size=%d, fileSize=%d", bi.Offset, bi.Size, fileSize)
+		}
 		switch bi.Type {
 		case BoxTypeFtyp():
 			var ftyp Ftyp
-			if _, err := bi.SeekToPayload(r); err != nil {
-				return nil, err
-			}
-			if err := checkPayloadSize(r, bi); err != nil {
-				return nil, err
-			}
-			if _, err := Unmarshal(r, bi.Size-bi.HeaderSize, &ftyp, bi.Context); err != nil {
+			if err := unmarshalBoxPayload(r, bi, &ftyp); err != nil {
 				return nil, err
 			}
 			probeInfo.MajorBrand = ftyp.MajorBrand
@@ -143,13 +203,7 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 			probeInfo.FastStart = !mdatAppeared
 		case BoxTypeMvhd():
 			var mvhd Mvhd
-			if _, err := bi.SeekToPayload(r); err != nil {
-				return nil, err
-			}
-			if err := checkPayloadSize(r, bi); err != nil {
-				return nil, err
-			}
-			if _, err := Unmarshal(r, bi.Size-bi.HeaderSize, &mvhd, bi.Context); err != nil {
+			if err := unmarshalBoxPayload(r, bi, &mvhd); err != nil {
 				return nil, err
 			}
 			probeInfo.Timescale = mvhd.Timescale
@@ -170,11 +224,99 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 				return nil, err
 			}
 			probeInfo.Segments = append(probeInfo.Segments, segments...)
+		case BoxTypeSidx():
+			index, err := probeSidx(r, bi)
+			if err != nil {
+				return nil, err
+			}
+			probeInfo.SegmentIndexes = append(probeInfo.SegmentIndexes, index)
 		case BoxTypeMdat():
 			mdatAppeared = true
 		}
 	}
 	return probeInfo, nil
+}
+
+// unmarshalBoxPayload seeks to the box payload and unmarshals it into dst.
+// Boxes whose payload is shorter than their fixed header (for example an
+// empty styp box) are skipped safely instead of surfacing an EOF error.
+func unmarshalBoxPayload(r io.ReadSeeker, bi *BoxInfo, dst IBox) error {
+	if _, err := bi.SeekToPayload(r); err != nil {
+		return err
+	}
+	if err := checkPayloadSize(r, bi); err != nil {
+		return err
+	}
+	payloadSize := bi.Size - bi.HeaderSize
+	if payloadSize == 0 {
+		return nil
+	}
+	_, err := Unmarshal(r, payloadSize, dst, bi.Context)
+	return err
+}
+
+// containerBoxTypes are box types whose payload consists entirely of child
+// boxes with no fixed prefix. scanBoxHeaders only recurses into these; every
+// other box (including stsd, whose payload starts with an 8-byte sample-entry
+// prefix, and sample entries such as avc1/mp4a) is treated as an opaque
+// payload and skipped by its declared size.
+var containerBoxTypes = map[BoxType]struct{}{
+	BoxTypeMoov(): {},
+	BoxTypeTrak(): {},
+	BoxTypeEdts(): {},
+	BoxTypeMdia(): {},
+	BoxTypeMinf(): {},
+	BoxTypeStbl(): {},
+	BoxTypeMvex(): {},
+	BoxTypeMoof(): {},
+	BoxTypeTraf(): {},
+	BoxTypeMfra(): {},
+	BoxTypeUdta(): {},
+}
+
+// scanBoxHeaders validates that every box declared within [start, start+limit)
+// fits entirely inside that range, recursively descending into container
+// boxes. It reads only box headers and never unmarshals payloads, so unknown
+// or optional boxes are skipped safely. A truncated or over-sized box yields
+// an error instead of a panic.
+func scanBoxHeaders(r io.ReadSeeker, start, limit uint64) error {
+	if _, err := r.Seek(int64(start), io.SeekStart); err != nil {
+		return err
+	}
+	end := start + limit
+	pos := start
+	sawBox := false
+	for pos+SmallHeaderSize <= end {
+		bi, err := ReadBoxInfo(r)
+		if err != nil {
+			// A partial header at the boundary means the file is truncated.
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				return fmt.Errorf("truncated box header at offset=%d", pos)
+			}
+			return err
+		}
+		sawBox = true
+		if bi.Offset+bi.Size > end {
+			return fmt.Errorf("box size exceeds containing range: type=%s, offset=%d, size=%d, rangeEnd=%d",
+				bi.Type.String(), bi.Offset, bi.Size, end)
+		}
+		if _, isContainer := containerBoxTypes[bi.Type]; isContainer {
+			if err := scanBoxHeaders(r, bi.Offset+bi.HeaderSize, bi.Size-bi.HeaderSize); err != nil {
+				return err
+			}
+		}
+		if _, err := r.Seek(int64(bi.Offset+bi.Size), io.SeekStart); err != nil {
+			return err
+		}
+		pos = bi.Offset + bi.Size
+	}
+	// Any bytes left over inside a container are a truncated child box header
+	// rather than valid padding. An empty root range keeps the historical
+	// "no boxes" semantics instead of being treated as truncation.
+	if sawBox && end-pos != 0 {
+		return fmt.Errorf("truncated box header at offset=%d", pos)
+	}
+	return nil
 }
 
 // ProbeFra probes fragmented MP4 file
@@ -558,42 +700,98 @@ func probeTraf(r io.ReadSeeker, bi *BoxInfo) (*Segment, error) {
 		}
 	}
 
-	if trun != nil {
-		segment.SampleCount = trun.SampleCount
+	if trun == nil {
+		// A traf without trun carries no samples; leave the counters at zero.
+		return segment, nil
+	}
+	segment.SampleCount = trun.SampleCount
 
-		if trun.CheckFlag(0x000100) {
-			segment.Duration = 0
-			for ei := range trun.Entries {
-				segment.Duration += trun.Entries[ei].SampleDuration
-			}
+	// Accumulate every per-sample value in 64 bits and convert once, so a
+	// fragment whose totals exceed uint32 results in an explicit error rather
+	// than wrapped values. The duration of every sample is resolved through
+	// exactly one rule: trun sample-duration when the flag is present,
+	// otherwise the tfhd default, keeping fragment duration consistent with
+	// the track timebase regardless of how the boxes encode it.
+	durationPresent := trun.CheckFlag(0x000100)
+	sizePresent := trun.CheckFlag(0x000200)
+
+	var totalDuration uint64
+	var totalSize uint64
+	var runningDuration uint64
+	for ei := range trun.Entries {
+		var sampleDuration uint32
+		if durationPresent {
+			sampleDuration = trun.Entries[ei].SampleDuration
 		} else {
-			segment.Duration = tfhd.DefaultSampleDuration * segment.SampleCount
+			sampleDuration = tfhd.DefaultSampleDuration
 		}
+		totalDuration += uint64(sampleDuration)
 
-		if trun.CheckFlag(0x000200) {
-			segment.Size = 0
-			for ei := range trun.Entries {
-				segment.Size += trun.Entries[ei].SampleSize
-			}
+		if sizePresent {
+			totalSize += uint64(trun.Entries[ei].SampleSize)
 		} else {
-			segment.Size = tfhd.DefaultSampleSize * segment.SampleCount
+			totalSize += uint64(tfhd.DefaultSampleSize)
 		}
 
-		var duration uint32
-		for ei := range trun.Entries {
-			offset := int32(duration) + int32(trun.GetSampleCompositionTimeOffset(ei))
-			if ei == 0 || offset < segment.CompositionTimeOffset {
-				segment.CompositionTimeOffset = offset
+		offset := int64(runningDuration) + trun.GetSampleCompositionTimeOffset(ei)
+		if ei == 0 || offset < int64(segment.CompositionTimeOffset) {
+			if offset < math.MinInt32 || offset > math.MaxInt32 {
+				return nil, fmt.Errorf("composition time offset overflows int32: %d", offset)
 			}
-			if trun.CheckFlag(0x000100) {
-				duration += trun.Entries[ei].SampleDuration
-			} else {
-				duration += tfhd.DefaultSampleDuration
-			}
+			segment.CompositionTimeOffset = int32(offset)
 		}
+		runningDuration += uint64(sampleDuration)
 	}
 
+	// Samples without trun entries (SampleCount larger than the entry list)
+	// fall back to the tfhd defaults.
+	missing := uint64(0)
+	if trun.SampleCount > uint32(len(trun.Entries)) {
+		missing = uint64(trun.SampleCount) - uint64(len(trun.Entries))
+	}
+	totalDuration += missing * uint64(tfhd.DefaultSampleDuration)
+	totalSize += missing * uint64(tfhd.DefaultSampleSize)
+
+	if totalDuration > math.MaxUint32 {
+		return nil, fmt.Errorf("segment duration overflows uint32: %d", totalDuration)
+	}
+	if totalSize > math.MaxUint32 {
+		return nil, fmt.Errorf("segment size overflows uint32: %d", totalSize)
+	}
+	segment.Duration = uint32(totalDuration)
+	segment.Size = uint32(totalSize)
+
 	return segment, nil
+}
+
+// probeSidx summarizes one sidx box. Both version 0 (32-bit) and version 1
+// (64-bit) boxes are normalized into the same SegmentIndex shape.
+func probeSidx(r io.ReadSeeker, bi *BoxInfo) (*SegmentIndex, error) {
+	var sidx Sidx
+	if err := unmarshalBoxPayload(r, bi, &sidx); err != nil {
+		return nil, err
+	}
+
+	index := &SegmentIndex{
+		Offset:                   bi.Offset,
+		ReferenceID:              sidx.ReferenceID,
+		Timescale:                sidx.Timescale,
+		Version:                  sidx.GetVersion(),
+		EarliestPresentationTime: sidx.GetEarliestPresentationTime(),
+		FirstOffset:              sidx.GetFirstOffset(),
+		References:               make([]SegmentIndexReference, 0, len(sidx.References)),
+	}
+	for _, ref := range sidx.References {
+		index.References = append(index.References, SegmentIndexReference{
+			ReferencedType:     ref.ReferenceType,
+			ReferencedSize:     ref.ReferencedSize,
+			SubsegmentDuration: ref.SubsegmentDuration,
+			StartsWithSAP:      ref.StartsWithSAP,
+			SAPType:            ref.SAPType,
+			SAPDeltaTime:       ref.SAPDeltaTime,
+		})
+	}
+	return index, nil
 }
 
 func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
