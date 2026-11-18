@@ -138,6 +138,57 @@ func (*Xxxx) GetType() BoxType {
 }
 ```
 
+### Runtime-registered Box Decoders
+
+When a box type cannot be expressed with the struct-tag scheme above (for
+example a business-specific box whose layout is only known at runtime), you can
+register a decoder function at runtime instead of waiting for an upstream
+release:
+
+```go
+type Xxxx struct {
+	mp4.FullBox
+	Value uint32
+}
+
+func init() {
+	// registration is safe for concurrent use with parsing
+	mp4.MustRegisterBoxDecoder(mp4.StrToBoxType("xxxx"), decodeXxxx)
+}
+
+func decodeXxxx(r io.ReadSeeker, boxType mp4.BoxType, payloadSize uint64, ctx mp4.Context) (mp4.IBox, uint64, error) {
+	// r is positioned at the beginning of the box payload.
+	header := make([]byte, 7) // version(1) + flags(3) + value(4)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, 0, err
+	}
+	box := &Xxxx{
+		Value: binary.BigEndian.Uint32(header[3:7]),
+	}
+	box.Version = header[0]
+	box.Flags = [3]byte{header[1], header[2], header[3]}
+	// return the number of bytes consumed; any remaining bytes are treated
+	// as child boxes by ReadBoxStructure
+	return box, 7, nil
+}
+```
+
+After registration, `ReadBoxStructure` reports the type as supported and
+`ReadPayload` / `ExtractBoxesWithPayload` return the decoded box. The details:
+
+- Use [RegisterBoxDecoder](https://pkg.go.dev/github.com/abema/go-mp4#RegisterBoxDecoder)
+  (returns an error on duplicate registration) or
+  [MustRegisterBoxDecoder](https://pkg.go.dev/github.com/abema/go-mp4#MustRegisterBoxDecoder),
+  and remove it again with
+  [UnregisterBoxDecoder](https://pkg.go.dev/github.com/abema/go-mp4#UnregisterBoxDecoder).
+- Registration and parsing are synchronized internally, so they may run
+  concurrently.
+- A registered decoder takes precedence over the built-in definition of the
+  same box type; unregistering it restores the built-in parser.
+- Box types without either a built-in definition or a registered decoder keep
+  being passed through transparently (`IsSupportedType` stays false and raw
+  payload access via `ReadData` keeps working).
+
 ### Buffering
 
 go-mp4 does not buffer I/O.

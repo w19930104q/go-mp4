@@ -124,6 +124,9 @@ func (boxType BoxType) getBoxDef(ctx Context) *boxDef {
 }
 
 func (boxType BoxType) IsSupported(ctx Context) bool {
+	if lookupBoxDecoder(boxType) != nil {
+		return true
+	}
 	return boxType.getBoxDef(ctx) != nil
 }
 

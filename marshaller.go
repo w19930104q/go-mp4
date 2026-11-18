@@ -276,6 +276,11 @@ type unmarshaller struct {
 }
 
 func UnmarshalAny(r io.ReadSeeker, boxType BoxType, payloadSize uint64, ctx Context) (box IBox, n uint64, err error) {
+	// Runtime-registered decoders take precedence over built-in definitions.
+	if box, n, ok, err := unmarshalWithRegisteredDecoder(r, boxType, payloadSize, ctx); ok {
+		return box, n, err
+	}
+
 	dst, err := boxType.New(ctx)
 	if err != nil {
 		return nil, 0, err
