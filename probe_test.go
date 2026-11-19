@@ -216,6 +216,170 @@ func TestProbeWithFMP4SeveralTrafs(t *testing.T) {
 	}
 }
 
+func TestProbeWithFMP4ReconstructedSampleTables(t *testing.T) {
+	// the mvhd/mdhd durations of this fragmented file are zero;
+	// the sample tables and durations are rebuilt from moof/traf boxes.
+	// all expected values have been verified against ffprobe.
+	f, err := os.Open("./testdata/sample_fragmented.mp4")
+	require.NoError(t, err)
+	defer f.Close()
+
+	info, err := Probe(f)
+	require.NoError(t, err)
+
+	// movie duration rebuilt from the longest track:
+	// 53343/44100s -> 1210 in the mvhd timescale of 1000
+	assert.Equal(t, uint64(1210), info.Duration)
+
+	require.Len(t, info.Tracks, 2)
+
+	video := info.Tracks[0]
+	assert.Equal(t, uint32(90000), video.Timescale)
+	assert.Equal(t, uint64(90000), video.Duration)
+	require.Len(t, video.Samples, 10)
+	expectedVideoSamples := []*Sample{
+		{Size: 974, TimeDelta: 9000, CompositionTimeOffset: 18000},
+		{Size: 40, TimeDelta: 9000, CompositionTimeOffset: 27000},
+		{Size: 40, TimeDelta: 9000, CompositionTimeOffset: 9000},
+		{Size: 242, TimeDelta: 9000, CompositionTimeOffset: 18000},
+		{Size: 40, TimeDelta: 9000, CompositionTimeOffset: 18000},
+		{Size: 242, TimeDelta: 9000, CompositionTimeOffset: 18000},
+		{Size: 40, TimeDelta: 9000, CompositionTimeOffset: 27000},
+		{Size: 40, TimeDelta: 9000, CompositionTimeOffset: 9000},
+		{Size: 242, TimeDelta: 9000, CompositionTimeOffset: 18000},
+		{Size: 40, TimeDelta: 9000, CompositionTimeOffset: 18000},
+	}
+	for i, expected := range expectedVideoSamples {
+		assert.Equal(t, expected, video.Samples[i], "video sample %d", i)
+	}
+	require.Len(t, video.Chunks, 4)
+	assert.Equal(t, uint64(1363), video.Chunks[0].DataOffset)
+	assert.Equal(t, uint32(3), video.Chunks[0].SamplesPerChunk)
+	assert.Equal(t, uint64(2870), video.Chunks[1].DataOffset)
+	assert.Equal(t, uint32(2), video.Chunks[1].SamplesPerChunk)
+	assert.Equal(t, uint64(3703), video.Chunks[2].DataOffset)
+	assert.Equal(t, uint32(3), video.Chunks[2].SamplesPerChunk)
+	assert.Equal(t, uint64(4694), video.Chunks[3].DataOffset)
+	assert.Equal(t, uint32(2), video.Chunks[3].SamplesPerChunk)
+
+	audio := info.Tracks[1]
+	assert.Equal(t, uint32(44100), audio.Timescale)
+	assert.Equal(t, uint64(53343), audio.Duration)
+	require.Len(t, audio.Samples, 44)
+	assert.Equal(t, &Sample{Size: 44, TimeDelta: 8830}, audio.Samples[0])
+	assert.Equal(t, &Sample{Size: 29, TimeDelta: 1024}, audio.Samples[1])
+	assert.Equal(t, &Sample{Size: 38, TimeDelta: 1505}, audio.Samples[4])
+	assert.Equal(t, &Sample{Size: 28, TimeDelta: 1024}, audio.Samples[5])
+	assert.Equal(t, &Sample{Size: 26, TimeDelta: 1024}, audio.Samples[43])
+	require.Len(t, audio.Chunks, 4)
+	assert.Equal(t, uint64(2565), audio.Chunks[0].DataOffset)
+	assert.Equal(t, uint32(5), audio.Chunks[0].SamplesPerChunk)
+	assert.Equal(t, uint64(3296), audio.Chunks[1].DataOffset)
+	assert.Equal(t, uint32(9), audio.Chunks[1].SamplesPerChunk)
+	assert.Equal(t, uint64(4185), audio.Chunks[2].DataOffset)
+	assert.Equal(t, uint32(13), audio.Chunks[2].SamplesPerChunk)
+	assert.Equal(t, uint64(5152), audio.Chunks[3].DataOffset)
+	assert.Equal(t, uint32(17), audio.Chunks[3].SamplesPerChunk)
+
+	// IDR frames can be located in the rebuilt sample table:
+	// the first sample of each video fragment
+	idxs, err := FindIDRFrames(f, video)
+	require.NoError(t, err)
+	assert.Equal(t, []int{0, 3, 5, 8}, idxs)
+}
+
+func TestProbeWithFMP4SeveralTrafsReconstructed(t *testing.T) {
+	// two moof boxes, each with a traf for the video track and one for the
+	// audio track; all expected values have been verified against ffprobe.
+	f, err := os.Open("./testdata/sample_fragmented_muxed.mp4")
+	require.NoError(t, err)
+	defer f.Close()
+
+	info, err := Probe(f)
+	require.NoError(t, err)
+
+	// 7455/10240s -> 728 in the mvhd timescale of 1000
+	assert.Equal(t, uint64(728), info.Duration)
+
+	require.Len(t, info.Tracks, 2)
+
+	video := info.Tracks[0]
+	assert.Equal(t, uint64(7455), video.Duration)
+	require.Len(t, video.Samples, 6)
+	expectedVideoSamples := []*Sample{
+		{Size: 1372, TimeDelta: 2335},
+		{Size: 15, TimeDelta: 1024},
+		{Size: 79, TimeDelta: 1024},
+		{Size: 765, TimeDelta: 1024},
+		{Size: 25, TimeDelta: 1024},
+		{Size: 23, TimeDelta: 1024},
+	}
+	for i, expected := range expectedVideoSamples {
+		assert.Equal(t, expected, video.Samples[i], "video sample %d", i)
+	}
+	require.Len(t, video.Chunks, 2)
+	assert.Equal(t, uint64(1448), video.Chunks[0].DataOffset)
+	assert.Equal(t, uint32(3), video.Chunks[0].SamplesPerChunk)
+	assert.Equal(t, uint64(4280), video.Chunks[1].DataOffset)
+	assert.Equal(t, uint32(3), video.Chunks[1].SamplesPerChunk)
+
+	audio := info.Tracks[1]
+	assert.Equal(t, uint64(5824), audio.Duration)
+	require.Len(t, audio.Samples, 6)
+	expectedAudioSamples := []*Sample{
+		{Size: 340, TimeDelta: 1024},
+		{Size: 324, TimeDelta: 1024},
+		{Size: 248, TimeDelta: 1024},
+		{Size: 238, TimeDelta: 1024},
+		{Size: 294, TimeDelta: 1024},
+		{Size: 258, TimeDelta: 704},
+	}
+	for i, expected := range expectedAudioSamples {
+		assert.Equal(t, expected, audio.Samples[i], "audio sample %d", i)
+	}
+	require.Len(t, audio.Chunks, 2)
+	assert.Equal(t, uint64(2914), audio.Chunks[0].DataOffset)
+	assert.Equal(t, uint32(4), audio.Chunks[0].SamplesPerChunk)
+	assert.Equal(t, uint64(5093), audio.Chunks[1].DataOffset)
+	assert.Equal(t, uint32(2), audio.Chunks[1].SamplesPerChunk)
+}
+
+func TestTrunSampleDefaultsFallback(t *testing.T) {
+	fullBox := func(flags uint32) FullBox {
+		return FullBox{Flags: [3]byte{byte(flags >> 16), byte(flags >> 8), byte(flags)}}
+	}
+	trex := &Trex{DefaultSampleDuration: 512, DefaultSampleSize: 100}
+
+	// values present in the trun entries win
+	trun := &Trun{FullBox: fullBox(0x000300), Entries: []TrunEntry{{SampleDuration: 1024, SampleSize: 50}}}
+	tfhd := &Tfhd{FullBox: fullBox(0x000018), DefaultSampleDuration: 2048, DefaultSampleSize: 60}
+	assert.Equal(t, uint32(1024), trunSampleDuration(trun, 0, tfhd, trex))
+	assert.Equal(t, uint32(50), trunSampleSize(trun, 0, tfhd, trex))
+
+	// tfhd defaults are used when the trun carries no per-sample values
+	trun = &Trun{FullBox: fullBox(0), Entries: []TrunEntry{{}}}
+	assert.Equal(t, uint32(2048), trunSampleDuration(trun, 0, tfhd, trex))
+	assert.Equal(t, uint32(60), trunSampleSize(trun, 0, tfhd, trex))
+
+	// trex defaults are the last resort
+	tfhd = &Tfhd{FullBox: fullBox(0)}
+	assert.Equal(t, uint32(512), trunSampleDuration(trun, 0, tfhd, trex))
+	assert.Equal(t, uint32(100), trunSampleSize(trun, 0, tfhd, trex))
+
+	// no defaults anywhere
+	assert.Equal(t, uint32(0), trunSampleDuration(trun, 0, tfhd, nil))
+	assert.Equal(t, uint32(0), trunSampleSize(trun, 0, tfhd, nil))
+}
+
+func TestRescaleDuration(t *testing.T) {
+	assert.Equal(t, uint64(0), rescaleDuration(100, 0, 1000))
+	assert.Equal(t, uint64(0), rescaleDuration(0, 90000, 1000))
+	assert.Equal(t, uint64(1000), rescaleDuration(90000, 90000, 1000))
+	assert.Equal(t, uint64(1210), rescaleDuration(53343, 44100, 1000)) // 1209.59... rounds to nearest
+	assert.Equal(t, uint64(728), rescaleDuration(7455, 10240, 1000))   // 727.99... rounds to nearest
+	assert.Equal(t, uint64(703), rescaleDuration(7200, 10240, 1000))   // 703.125 rounds down
+}
+
 func TestProbeFra(t *testing.T) {
 	f, err := os.Open("./testdata/sample_fragmented.mp4")
 	require.NoError(t, err)

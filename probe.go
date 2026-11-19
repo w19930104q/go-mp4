@@ -108,11 +108,25 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 		Tracks:   make([]*Track, 0, 8),
 		Segments: make([]*Segment, 0, 8),
 	}
+
+	// Detect fragmented MP4 in advance: when the file has an mvex box,
+	// the sample tables in moov are allowed to be empty and the actual
+	// sample data is described by moof/traf boxes.
+	mvexs, err := ExtractBoxes(r, nil, []BoxPath{
+		{BoxTypeMoov(), BoxTypeMvex()},
+	})
+	if err != nil {
+		return nil, err
+	}
+	fragmented := len(mvexs) != 0
+
 	bis, err := ExtractBoxes(r, nil, []BoxPath{
 		{BoxTypeFtyp()},
 		{BoxTypeMoov()},
 		{BoxTypeMoov(), BoxTypeMvhd()},
 		{BoxTypeMoov(), BoxTypeTrak()},
+		{BoxTypeMoov(), BoxTypeMvex(), BoxTypeMehd()},
+		{BoxTypeMoov(), BoxTypeMvex(), BoxTypeTrex()},
 		{BoxTypeMoof()},
 		{BoxTypeMdat()},
 	})
@@ -120,6 +134,9 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 		return nil, err
 	}
 	var mdatAppeared bool
+	var mehd *Mehd
+	trexes := make(map[uint32]*Trex)
+	var fragments []*trackFragment
 	for _, bi := range bis {
 		switch bi.Type {
 		case BoxTypeFtyp():
@@ -159,19 +176,50 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 				probeInfo.Duration = mvhd.DurationV1
 			}
 		case BoxTypeTrak():
-			track, err := probeTrak(r, bi)
+			track, err := probeTrak(r, bi, fragmented)
 			if err != nil {
 				return nil, err
 			}
 			probeInfo.Tracks = append(probeInfo.Tracks, track)
+		case BoxTypeMehd():
+			m := new(Mehd)
+			if _, err := bi.SeekToPayload(r); err != nil {
+				return nil, err
+			}
+			if err := checkPayloadSize(r, bi); err != nil {
+				return nil, err
+			}
+			if _, err := Unmarshal(r, bi.Size-bi.HeaderSize, m, bi.Context); err != nil {
+				return nil, err
+			}
+			mehd = m
+		case BoxTypeTrex():
+			trex := new(Trex)
+			if _, err := bi.SeekToPayload(r); err != nil {
+				return nil, err
+			}
+			if err := checkPayloadSize(r, bi); err != nil {
+				return nil, err
+			}
+			if _, err := Unmarshal(r, bi.Size-bi.HeaderSize, trex, bi.Context); err != nil {
+				return nil, err
+			}
+			trexes[trex.TrackID] = trex
 		case BoxTypeMoof():
-			segments, err := probeMoof(r, bi)
+			segments, frags, err := probeMoof(r, bi, trexes)
 			if err != nil {
 				return nil, err
 			}
 			probeInfo.Segments = append(probeInfo.Segments, segments...)
+			fragments = append(fragments, frags...)
 		case BoxTypeMdat():
 			mdatAppeared = true
+		}
+	}
+	if fragmented {
+		rebuildFragmentedSampleTables(probeInfo.Tracks, fragments)
+		if probeInfo.Duration == 0 {
+			probeInfo.Duration = fragmentDuration(probeInfo, mehd)
 		}
 	}
 	return probeInfo, nil
@@ -184,7 +232,7 @@ func ProbeFra(r io.ReadSeeker) (*FraProbeInfo, error) {
 	return (*FraProbeInfo)(probeInfo), err
 }
 
-func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
+func probeTrak(r io.ReadSeeker, bi *BoxInfo, fragmented bool) (*Track, error) {
 	track := new(Track)
 
 	bips, err := ExtractBoxesWithPayload(r, bi, []BoxPath{
@@ -322,32 +370,42 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 				DataOffset: offset,
 			})
 		}
-	} else {
+	} else if !fragmented {
+		// fragmented MP4 may have no stco/co64 box because
+		// the sample data is described by moof/traf boxes
 		return nil, errors.New("stco/co64 box not found")
 	}
 
-	if stts == nil {
-		return nil, errors.New("stts box not found")
-	}
 	track.Samples = make([]*Sample, 0)
-	for _, entry := range stts.Entries {
-		for i := uint32(0); i < entry.SampleCount; i++ {
-			track.Samples = append(track.Samples, &Sample{
-				TimeDelta: entry.SampleDelta,
-			})
+	if stts == nil {
+		if !fragmented {
+			// fragmented MP4 may have no stts box because
+			// the sample table is rebuilt from moof/traf boxes
+			return nil, errors.New("stts box not found")
+		}
+	} else {
+		for _, entry := range stts.Entries {
+			for i := uint32(0); i < entry.SampleCount; i++ {
+				track.Samples = append(track.Samples, &Sample{
+					TimeDelta: entry.SampleDelta,
+				})
+			}
 		}
 	}
 
 	if stsc == nil {
-		return nil, errors.New("stsc box not found")
-	}
-	for si, entry := range stsc.Entries {
-		end := uint32(len(track.Chunks))
-		if si != len(stsc.Entries)-1 && stsc.Entries[si+1].FirstChunk-1 < end {
-			end = stsc.Entries[si+1].FirstChunk - 1
+		if !fragmented {
+			return nil, errors.New("stsc box not found")
 		}
-		for ci := entry.FirstChunk - 1; ci < end; ci++ {
-			track.Chunks[ci].SamplesPerChunk = entry.SamplesPerChunk
+	} else {
+		for si, entry := range stsc.Entries {
+			end := uint32(len(track.Chunks))
+			if si != len(stsc.Entries)-1 && stsc.Entries[si+1].FirstChunk-1 < end {
+				end = stsc.Entries[si+1].FirstChunk - 1
+			}
+			for ci := entry.FirstChunk - 1; ci < end; ci++ {
+				track.Chunks[ci].SamplesPerChunk = entry.SamplesPerChunk
+			}
 		}
 	}
 
@@ -499,38 +557,115 @@ func getAudioObjectType(r bitio.Reader) (byte, int, error) {
 	return audioObjectType[0] + 32, 11, nil
 }
 
+// trackFragment holds the sample-level data reconstructed from a single
+// traf box of a fragmented MP4 file.
+type trackFragment struct {
+	trackID uint32
+	chunks  Chunks
+	samples Samples
+}
+
+// rebuildFragmentedSampleTables rebuilds the sample tables (samples, chunks)
+// and the duration of each track from the movie fragments, as the sample
+// tables in moov are empty for fragmented MP4 files.
+func rebuildFragmentedSampleTables(tracks Tracks, fragments []*trackFragment) {
+	fragmentsByTrack := make(map[uint32][]*trackFragment, len(tracks))
+	for _, fragment := range fragments {
+		fragmentsByTrack[fragment.trackID] = append(fragmentsByTrack[fragment.trackID], fragment)
+	}
+	for _, track := range tracks {
+		frags := fragmentsByTrack[track.TrackID]
+		if len(frags) == 0 {
+			continue
+		}
+		track.Chunks = make(Chunks, 0)
+		track.Samples = make(Samples, 0)
+		var duration uint64
+		for _, fragment := range frags {
+			track.Chunks = append(track.Chunks, fragment.chunks...)
+			track.Samples = append(track.Samples, fragment.samples...)
+		}
+		for _, sample := range track.Samples {
+			duration += uint64(sample.TimeDelta)
+		}
+		track.Duration = duration
+	}
+}
+
+// fragmentDuration computes the presentation duration in the movie timescale
+// for a fragmented MP4 file whose mvhd duration is zero. It prefers the mehd
+// box and falls back to the longest track duration.
+func fragmentDuration(probeInfo *ProbeInfo, mehd *Mehd) uint64 {
+	if mehd != nil {
+		var d uint64
+		if mehd.GetVersion() == 0 {
+			d = uint64(mehd.FragmentDurationV0)
+		} else {
+			d = mehd.FragmentDurationV1
+		}
+		if d != 0 {
+			return d
+		}
+	}
+	var duration uint64
+	for _, track := range probeInfo.Tracks {
+		if d := rescaleDuration(track.Duration, track.Timescale, probeInfo.Timescale); d > duration {
+			duration = d
+		}
+	}
+	return duration
+}
+
+// rescaleDuration converts a duration from one timescale to another,
+// rounding to the nearest value.
+func rescaleDuration(duration uint64, from, to uint32) uint64 {
+	if from == 0 || duration == 0 {
+		return 0
+	}
+	// split into quotient and remainder to avoid overflow
+	q, r := duration/uint64(from), duration%uint64(from)
+	return q*uint64(to) + (r*uint64(to)+uint64(from)/2)/uint64(from)
+}
+
 // probeMoof returns a segment for each track fragment of the moof box.
-func probeMoof(r io.ReadSeeker, bi *BoxInfo) ([]*Segment, error) {
+func probeMoof(r io.ReadSeeker, bi *BoxInfo, trexes map[uint32]*Trex) ([]*Segment, []*trackFragment, error) {
 	trafs, err := ExtractBox(r, bi, BoxPath{BoxTypeTraf()})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	segments := make([]*Segment, 0, len(trafs))
+	fragments := make([]*trackFragment, 0, len(trafs))
+	// dataEnd is used to resolve the implicit base data offset:
+	// it is the moof offset for the first traf of the moof box, and the
+	// end of the previous traf's sample data for the subsequent ones.
+	dataEnd := bi.Offset
 	for _, traf := range trafs {
-		segment, err := probeTraf(r, traf)
+		segment, fragment, end, err := probeTraf(r, traf, bi.Offset, dataEnd, trexes)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		segment.MoofOffset = bi.Offset
 		segments = append(segments, segment)
+		fragments = append(fragments, fragment)
+		dataEnd = end
 	}
-	return segments, nil
+	return segments, fragments, nil
 }
 
-func probeTraf(r io.ReadSeeker, bi *BoxInfo) (*Segment, error) {
+func probeTraf(r io.ReadSeeker, bi *BoxInfo, moofOffset, prevDataEnd uint64, trexes map[uint32]*Trex) (*Segment, *trackFragment, uint64, error) {
 	bips, err := ExtractBoxesWithPayload(r, bi, []BoxPath{
 		{BoxTypeTfhd()},
 		{BoxTypeTfdt()},
 		{BoxTypeTrun()},
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, 0, err
 	}
 
 	var tfhd *Tfhd
 	var tfdt *Tfdt
-	var trun *Trun
+	truns := make([]*Trun, 0, 1)
 
 	segment := &Segment{}
 	for _, bip := range bips {
@@ -540,12 +675,12 @@ func probeTraf(r io.ReadSeeker, bi *BoxInfo) (*Segment, error) {
 		case BoxTypeTfdt():
 			tfdt = bip.Payload.(*Tfdt)
 		case BoxTypeTrun():
-			trun = bip.Payload.(*Trun)
+			truns = append(truns, bip.Payload.(*Trun))
 		}
 	}
 
 	if tfhd == nil {
-		return nil, errors.New("tfhd not found")
+		return nil, nil, 0, errors.New("tfhd not found")
 	}
 	segment.TrackID = tfhd.TrackID
 	segment.DefaultSampleDuration = tfhd.DefaultSampleDuration
@@ -558,42 +693,91 @@ func probeTraf(r io.ReadSeeker, bi *BoxInfo) (*Segment, error) {
 		}
 	}
 
-	if trun != nil {
-		segment.SampleCount = trun.SampleCount
+	trex := trexes[tfhd.TrackID] // may be nil
 
-		if trun.CheckFlag(0x000100) {
-			segment.Duration = 0
-			for ei := range trun.Entries {
-				segment.Duration += trun.Entries[ei].SampleDuration
-			}
-		} else {
-			segment.Duration = tfhd.DefaultSampleDuration * segment.SampleCount
+	// resolve the base data offset of this track fragment
+	var baseDataOffset uint64
+	switch {
+	case tfhd.CheckFlag(0x000001): // base-data-offset-present
+		baseDataOffset = tfhd.BaseDataOffset
+	case tfhd.CheckFlag(0x020000): // default-base-is-moof
+		baseDataOffset = moofOffset
+	default:
+		baseDataOffset = prevDataEnd
+	}
+
+	fragment := &trackFragment{trackID: tfhd.TrackID}
+	dataOffset := baseDataOffset
+	var decodeTime uint32
+	firstSample := true
+	for _, trun := range truns {
+		segment.SampleCount += trun.SampleCount
+
+		if trun.CheckFlag(0x000001) { // data-offset-present
+			dataOffset = uint64(int64(baseDataOffset) + int64(trun.DataOffset))
 		}
+		fragment.chunks = append(fragment.chunks, &Chunk{
+			DataOffset:      dataOffset,
+			SamplesPerChunk: trun.SampleCount,
+		})
 
-		if trun.CheckFlag(0x000200) {
-			segment.Size = 0
-			for ei := range trun.Entries {
-				segment.Size += trun.Entries[ei].SampleSize
-			}
-		} else {
-			segment.Size = tfhd.DefaultSampleSize * segment.SampleCount
-		}
-
-		var duration uint32
 		for ei := range trun.Entries {
-			offset := int32(duration) + int32(trun.GetSampleCompositionTimeOffset(ei))
-			if ei == 0 || offset < segment.CompositionTimeOffset {
+			duration := trunSampleDuration(trun, ei, tfhd, trex)
+			size := trunSampleSize(trun, ei, tfhd, trex)
+			var cto int64
+			if trun.CheckFlag(0x000800) { // sample-composition-time-offset-present
+				cto = trun.GetSampleCompositionTimeOffset(ei)
+			}
+			fragment.samples = append(fragment.samples, &Sample{
+				Size:                  size,
+				TimeDelta:             duration,
+				CompositionTimeOffset: cto,
+			})
+
+			segment.Duration += duration
+			segment.Size += size
+
+			offset := int32(decodeTime) + int32(cto)
+			if firstSample || offset < segment.CompositionTimeOffset {
 				segment.CompositionTimeOffset = offset
 			}
-			if trun.CheckFlag(0x000100) {
-				duration += trun.Entries[ei].SampleDuration
-			} else {
-				duration += tfhd.DefaultSampleDuration
-			}
+			firstSample = false
+			decodeTime += duration
+			dataOffset += uint64(size)
 		}
 	}
 
-	return segment, nil
+	return segment, fragment, dataOffset, nil
+}
+
+// trunSampleDuration resolves the duration of a trun entry, falling back to
+// the tfhd default and then to the trex default.
+func trunSampleDuration(trun *Trun, index int, tfhd *Tfhd, trex *Trex) uint32 {
+	if trun.CheckFlag(0x000100) { // sample-duration-present
+		return trun.Entries[index].SampleDuration
+	}
+	if tfhd.CheckFlag(0x000008) { // default-sample-duration-present
+		return tfhd.DefaultSampleDuration
+	}
+	if trex != nil {
+		return trex.DefaultSampleDuration
+	}
+	return 0
+}
+
+// trunSampleSize resolves the size of a trun entry, falling back to the tfhd
+// default and then to the trex default.
+func trunSampleSize(trun *Trun, index int, tfhd *Tfhd, trex *Trex) uint32 {
+	if trun.CheckFlag(0x000200) { // sample-size-present
+		return trun.Entries[index].SampleSize
+	}
+	if tfhd.CheckFlag(0x000010) { // default-sample-size-present
+		return tfhd.DefaultSampleSize
+	}
+	if trex != nil {
+		return trex.DefaultSampleSize
+	}
+	return 0
 }
 
 func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
