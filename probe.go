@@ -38,7 +38,59 @@ type Track struct {
 	Chunks    Chunks
 	AVC       *AVCDecConfigInfo
 	MP4A      *MP4AInfo
+
+	// MovieTimescale is the timescale of the movie (mvhd) timeline, which is
+	// also the timescale of edit-list SegmentDuration values.
+	MovieTimescale uint32
+	// PresentationDuration is the track duration on the presentation
+	// (movie) timeline in MovieTimescale units, i.e. the sum of the edit
+	// list segment durations including empty edits. When the track has no
+	// edit list, it is the media Duration converted into MovieTimescale
+	// units, which equals the tkhd duration.
+	PresentationDuration uint64
 }
+
+// GetPresentationDuration returns the track's duration on the presentation
+// timeline in movie timescale units. With an edit list it is the sum of all
+// edit-list segment durations (empty edits included); without an edit list
+// the full media duration is mapped onto the presentation timeline.
+func (t *Track) GetPresentationDuration() uint64 {
+	return t.PresentationDuration
+}
+
+// GetPresentationTime converts a media timeline time (media timescale units)
+// into a presentation timeline time (movie timescale units). Without an edit
+// list the media timeline is mapped one-to-one onto the presentation timeline
+// with only a timescale conversion. It returns false when the time is not
+// presented (outside every non-empty edit).
+func (t *Track) GetPresentationTime(mediaTime uint64) (uint64, bool) {
+	if len(t.EditList) == 0 {
+		if t.MovieTimescale == 0 || t.Timescale == 0 {
+			return 0, false
+		}
+		return mediaTime * uint64(t.MovieTimescale) / uint64(t.Timescale), true
+	}
+	return t.EditList.GetPresentationTime(mediaTime, t.MovieTimescale, t.Timescale)
+}
+
+// GetMediaTime converts a presentation timeline time (movie timescale units)
+// into a media timeline time (media timescale units). Without an edit list
+// only the timescale conversion is applied. It returns false when the time
+// falls inside an empty edit or after the end of the edit list.
+func (t *Track) GetMediaTime(presentationTime uint64) (uint64, bool) {
+	if len(t.EditList) == 0 {
+		if t.MovieTimescale == 0 || t.Timescale == 0 {
+			return 0, false
+		}
+		return presentationTime * uint64(t.Timescale) / uint64(t.MovieTimescale), true
+	}
+	return t.EditList.GetMediaTime(presentationTime, t.MovieTimescale, t.Timescale)
+}
+
+// emptyEditMediaTime is the media_time value defined by ISO 14496-12 for an
+// empty edit. Such an edit inserts an interval of un-inited silence/blank
+// into the presentation timeline and is not mapped to any media time.
+const emptyEditMediaTime = -1
 
 type Codec int
 
@@ -53,6 +105,110 @@ type EditList []*EditListEntry
 type EditListEntry struct {
 	MediaTime       int64
 	SegmentDuration uint64
+}
+
+// IsEmpty reports whether the entry is an empty edit.
+// ISO 14496-12 defines an empty edit as an edit-list entry whose media_time
+// is -1. Empty edits place silence/blank on the presentation timeline and do
+// not map to any point on the media timeline.
+func (e *EditListEntry) IsEmpty() bool {
+	return e != nil && e.MediaTime == emptyEditMediaTime
+}
+
+// GetPresentationDuration returns the total presentation duration of the edit
+// list in movie timescale units (the units of the mvhd box and of every
+// entry's SegmentDuration). Empty edits are included, because they occupy a
+// real interval of the presentation timeline.
+func (el EditList) GetPresentationDuration() uint64 {
+	var total uint64
+	for _, entry := range el {
+		total += entry.SegmentDuration
+	}
+	return total
+}
+
+// GetMediaDuration returns the amount of media consumed by the edit list,
+// measured in media timescale units (the units of the mdhd box and of
+// MediaTime). Empty edits consume no media and are skipped.
+//
+// SegmentDuration is stored in movie timescale units, so mediaTimescale must
+// be the track's media timescale (Track.Timescale) and movieTimescale the
+// movie timescale (ProbeInfo.Timescale).
+func (el EditList) GetMediaDuration(movieTimescale, mediaTimescale uint32) uint64 {
+	if movieTimescale == 0 || mediaTimescale == 0 {
+		return 0
+	}
+	var total uint64
+	for _, entry := range el {
+		if entry.IsEmpty() {
+			continue
+		}
+		total += entry.SegmentDuration * uint64(mediaTimescale) / uint64(movieTimescale)
+	}
+	return total
+}
+
+// GetPresentationTime converts a media timeline time (in media timescale
+// units) into a presentation timeline time (in movie timescale units)
+// according to the edit list. It returns (0, false) for media time outside
+// every non-empty edit, which also covers empty edits.
+//
+// mediaTimescale must be the track's media timescale (Track.Timescale) and
+// movieTimescale the movie timescale (ProbeInfo.Timescale).
+func (el EditList) GetPresentationTime(mediaTime uint64, movieTimescale, mediaTimescale uint32) (uint64, bool) {
+	if movieTimescale == 0 || mediaTimescale == 0 {
+		return 0, false
+	}
+	var presentationOffset uint64
+	mt := uint64(movieTimescale)
+	ts := uint64(mediaTimescale)
+	for _, entry := range el {
+		if entry.IsEmpty() || entry.MediaTime < 0 {
+			// empty edits (and any invalid negative media_time) map no media
+			presentationOffset += entry.SegmentDuration
+			continue
+		}
+		mediaStart := uint64(entry.MediaTime)
+		if mediaTime < mediaStart {
+			presentationOffset += entry.SegmentDuration
+			continue
+		}
+		// Exact range test using cross multiplication, so that truncation of
+		// the converted segment duration cannot make adjacent edits overlap.
+		relativeMediaTime := mediaTime - mediaStart
+		if relativeMediaTime*mt < entry.SegmentDuration*ts {
+			return presentationOffset + relativeMediaTime*mt/ts, true
+		}
+		presentationOffset += entry.SegmentDuration
+	}
+	return 0, false
+}
+
+// GetMediaTime converts a presentation timeline time (in movie timescale
+// units) into a media timeline time (in media timescale units) according to
+// the edit list. It returns (0, false) when presentationTime falls inside an
+// empty edit or after the end of the edit list.
+//
+// mediaTimescale must be the track's media timescale (Track.Timescale) and
+// movieTimescale the movie timescale (ProbeInfo.Timescale).
+func (el EditList) GetMediaTime(presentationTime uint64, movieTimescale, mediaTimescale uint32) (uint64, bool) {
+	if movieTimescale == 0 || mediaTimescale == 0 {
+		return 0, false
+	}
+	var presentationOffset uint64
+	for _, entry := range el {
+		end := presentationOffset + entry.SegmentDuration
+		if presentationTime < end {
+			if entry.IsEmpty() || entry.MediaTime < 0 {
+				return 0, false
+			}
+			relativePresentationTime := presentationTime - presentationOffset
+			mediaTime := relativePresentationTime * uint64(mediaTimescale) / uint64(movieTimescale)
+			return uint64(entry.MediaTime) + mediaTime, true
+		}
+		presentationOffset = end
+	}
+	return 0, false
 }
 
 type Samples []*Sample
@@ -159,7 +315,7 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 				probeInfo.Duration = mvhd.DurationV1
 			}
 		case BoxTypeTrak():
-			track, err := probeTrak(r, bi)
+			track, err := probeTrak(r, bi, probeInfo.Timescale)
 			if err != nil {
 				return nil, err
 			}
@@ -184,8 +340,9 @@ func ProbeFra(r io.ReadSeeker) (*FraProbeInfo, error) {
 	return (*FraProbeInfo)(probeInfo), err
 }
 
-func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
+func probeTrak(r io.ReadSeeker, bi *BoxInfo, movieTimescale uint32) (*Track, error) {
 	track := new(Track)
+	track.MovieTimescale = movieTimescale
 
 	bips, err := ExtractBoxesWithPayload(r, bi, []BoxPath{
 		{BoxTypeTkhd()},
@@ -284,6 +441,15 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	}
 	track.Timescale = mdhd.Timescale
 	track.Duration = mdhd.GetDuration()
+
+	// The presentation duration is expressed on the movie (mvhd) timeline.
+	// With an edit list it is the sum of all segment durations, including
+	// empty edits; without one the whole media is presented.
+	if len(track.EditList) > 0 {
+		track.PresentationDuration = track.EditList.GetPresentationDuration()
+	} else if movieTimescale != 0 && track.Timescale != 0 {
+		track.PresentationDuration = track.Duration * uint64(movieTimescale) / uint64(track.Timescale)
+	}
 
 	if avc1 != nil && avcC != nil {
 		track.AVC = &AVCDecConfigInfo{
