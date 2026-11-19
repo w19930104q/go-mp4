@@ -10,6 +10,7 @@ import (
 	"github.com/abema/go-mp4/cmd/mp4tool/internal/extract"
 	"github.com/abema/go-mp4/cmd/mp4tool/internal/probe"
 	"github.com/abema/go-mp4/cmd/mp4tool/internal/psshdump"
+	"github.com/abema/go-mp4/cmd/mp4tool/internal/trim"
 )
 
 func main() {
@@ -31,6 +32,8 @@ func main() {
 		os.Exit(probe.Main(args[1:]))
 	case "extract":
 		os.Exit(extract.Main(args[1:]))
+	case "trim":
+		os.Exit(trim.Main(args[1:]))
 	case "alpha":
 		os.Exit(alpha(args[1:]))
 	default:
@@ -64,6 +67,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "  psshdump     : display pssh box attributes")
 	fmt.Fprintln(os.Stderr, "  probe        : probe and summarize mp4 file status")
 	fmt.Fprintln(os.Stderr, "  extract      : extract specific box")
+	fmt.Fprintln(os.Stderr, "  trim         : extract a time range of tracks")
 	fmt.Fprintln(os.Stderr, "  alpha edit")
 	fmt.Fprintln(os.Stderr, "  alpha divide")
 }

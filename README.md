@@ -116,6 +116,19 @@ The following sample code adds a metadata box and updates the chunk offsets in t
 
 [Sample Code: Insert Metadata and Update stco box](https://gist.github.com/sunfish-shogi/cccde016a38c66d32c07a0234368804e)
 
+### Extracting a Time Range
+
+[ExtractRange](https://pkg.go.dev/github.com/abema/go-mp4#ExtractRange) writes a new MP4 file that contains exactly the samples within a half-open time range `[startTime, endTime)` (in units of the movie timescale, cf. `ProbeInfo.Timescale`).
+The sample data bytes and the track properties are copied from the source without re-encoding, and the timing tables are rebuilt for the extracted range.
+
+```go
+// extract the samples within [1.0s, 2.5s) (movie timescale: 1000)
+err := mp4.ExtractRange(inputFile, outputFile, 1000, 2500)
+if errors.Is(err, mp4.ErrOutOfRange) {
+   // the range lies outside of the media duration
+}
+```
+
 ### User-defined Boxes
 
 You can define additional box types as follows:
