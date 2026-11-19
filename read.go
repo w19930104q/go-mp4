@@ -52,14 +52,14 @@ func ReadBoxStructure(r io.ReadSeeker, handler ReadHandler, params ...interface{
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	return readBoxStructure(r, 0, true, nil, Context{}, handler, params)
+	return readBoxStructure(r, 0, true, nil, Context{}, handler, params, nil)
 }
 
 func ReadBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, handler ReadHandler, params ...interface{}) (interface{}, error) {
-	return readBoxStructureFromInternal(r, bi, nil, handler, params)
+	return readBoxStructureFromInternal(r, bi, nil, handler, params, nil)
 }
 
-func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, handler ReadHandler, params []interface{}) (interface{}, error) {
+func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, handler ReadHandler, params []interface{}, rec *boxIndexRecorder) (interface{}, error) {
 	if _, err := bi.SeekToPayload(r); err != nil {
 		return nil, err
 	}
@@ -113,6 +113,15 @@ func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, ha
 	newPath := make(BoxPath, len(path)+1)
 	copy(newPath, path)
 	newPath[len(path)] = bi.Type
+
+	// When building a BoxIndex, record this box in the same depth-first
+	// order the traversal visits it. This guarantees the index is
+	// consistent with a sequential ReadBoxStructure scan.
+	if rec != nil {
+		if err := rec.record(bi, newPath); err != nil {
+			return nil, err
+		}
+	}
 
 	h := &ReadHandle{
 		Params:  params,
@@ -171,7 +180,7 @@ func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, ha
 		}
 
 		childrenSize := bi.Offset + bi.Size - childrenOffset
-		return readBoxStructure(r, childrenSize, false, newPath, ctx, handler, params)
+		return readBoxStructure(r, childrenSize, false, newPath, ctx, handler, params, rec)
 	}
 
 	if val, err := handler(h); err != nil {
@@ -183,7 +192,7 @@ func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, ha
 	}
 }
 
-func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPath, ctx Context, handler ReadHandler, params []interface{}) ([]interface{}, error) {
+func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPath, ctx Context, handler ReadHandler, params []interface{}, rec *boxIndexRecorder) ([]interface{}, error) {
 	vals := make([]interface{}, 0, 8)
 
 	for isRoot || totalSize >= SmallHeaderSize {
@@ -201,7 +210,7 @@ func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPa
 
 		bi.Context = ctx
 
-		val, err := readBoxStructureFromInternal(r, bi, path, handler, params)
+		val, err := readBoxStructureFromInternal(r, bi, path, handler, params, rec)
 		if err != nil {
 			return nil, err
 		}

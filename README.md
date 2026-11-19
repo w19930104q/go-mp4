@@ -72,6 +72,54 @@ if err != nil {
 fmt.Println("track num:", len(info.Tracks))
 ```
 
+#### Structural index and random access
+
+Repeatedly parsing a large file with ReadBoxStructure or ExtractBox rescans the
+same box tree every time. When you need to look boxes up more than once, build a
+[BoxIndex](https://pkg.go.dev/github.com/abema/go-mp4#BoxIndex) once. It records
+the box structure during a single depth-first scan, after which you can locate
+boxes by ordinal, file offset, or path without scanning the structure again.
+
+```go
+// Build the index once. The result is identical to a sequential scan.
+idx, err := mp4.BuildBoxIndex(file)
+if err != nil {
+    :
+}
+
+// Locate by depth-first ordinal (the same order ReadBoxStructure visits).
+box, err := idx.BoxAt(42)
+
+// Locate directly by the box's start offset in the file (binary search).
+box, err = idx.BoxAtOffset(6566)
+
+// Locate by path, or collect every matching box.
+moov, err := idx.Find(mp4.BoxPath{mp4.BoxTypeMoov()})
+trakInfos, err := idx.ExtractBoxes(moov, []mp4.BoxPath{
+    {mp4.BoxTypeTrak(), mp4.BoxTypeTkhd()},
+})
+
+// Read a payload by seeking straight to it, with no surrounding re-scan.
+payload, _, err := idx.ReadPayload(moov)
+```
+
+The index stores only fixed-size structural records (offset, size, header size,
+type, context and path) — never box payloads. Its memory usage therefore has a
+hard upper bound determined by the number of records. Use
+[WithIndexCapacity](https://pkg.go.dev/github.com/abema/go-mp4#WithIndexCapacity)
+to set that bound; if the file contains more boxes than the capacity,
+BuildBoxIndex fails with `ErrIndexCapacityExceeded` instead of growing without
+limit. A capacity of zero removes the bound.
+
+```go
+// Keep at most 10000 box records in memory.
+idx, err := mp4.BuildBoxIndex(file, mp4.WithIndexCapacity(10000))
+```
+
+Boxes reached through the index have exactly the same `BoxInfo`, `Path` and
+ordering as those produced by a sequential ReadBoxStructure scan. Not using an
+index leaves all other APIs unchanged.
+
 ### Writing
 
 Writer helps you write a box tree.
